@@ -6,6 +6,7 @@ from decimal import Decimal
 from io import BytesIO
 from typing import Any
 from unittest import TestCase, mock
+from urllib.parse import urljoin
 from urllib.request import pathname2url
 import json
 import os
@@ -2539,6 +2540,291 @@ class TestRefResolver(TestCase):
         self.assertEqual(
             (validator.is_valid({"x": "y"}), validator.is_valid({"x": 37})),
             (False, True),
+        )
+
+
+class LegacyContextManagerResolver:
+    """
+    A resolver in the style of the oldest legacy resolvers.
+
+    It offers only a temporary resolution context: entering ``resolving``
+    switches to the referenced file's location, and leaving it restores
+    the previous one. All documents live in an in-memory store.
+    """
+
+    def __init__(self, base_uri, store):
+        self.scopes = [base_uri]
+        self.store = store
+        self.resolutions = []
+
+    @contextmanager
+    def resolving(self, ref):
+        url = urljoin(self.scopes[-1], ref)
+        self.resolutions.append(url)
+        resolved = self.store[url]
+        self.scopes.append(url)
+        try:
+            yield resolved
+        finally:
+            self.scopes.pop()
+
+
+class TestLegacyRefResolverScopeManagement(TestCase):
+    """
+    The resolution scope of a legacy resolver must cover the whole
+    production of errors from the referenced schema, not just the
+    creation of the error iterator.
+    """
+
+    MAIN = "https://example.com/main.json"
+    CHILD = "https://example.com/rules/child.json"
+    OTHER = "https://example.com/rules/other.json"
+
+    def store(self):
+        return {
+            self.MAIN: {
+                "$id": self.MAIN,
+                "properties": {"thing": {"$ref": "rules/child.json"}},
+            },
+            self.CHILD: {"$id": self.CHILD, "$ref": "other.json"},
+            self.OTHER: {"$id": self.OTHER, "type": "integer"},
+        }
+
+    def validator(self, schema, resolver):
+        return validators.Draft202012Validator(schema, resolver=resolver)
+
+    def test_nested_relative_references_stay_in_scope(self):
+        store = self.store()
+        resolver = LegacyContextManagerResolver(self.MAIN, store)
+        validator = self.validator(store[self.MAIN], resolver)
+
+        validator.validate({"thing": 12})  # completely valid data
+
+        self.assertEqual(resolver.resolutions, [self.CHILD, self.OTHER])
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_nested_relative_references_report_errors_correctly(self):
+        store = self.store()
+        resolver = LegacyContextManagerResolver(self.MAIN, store)
+        validator = self.validator(store[self.MAIN], resolver)
+
+        (error,) = validator.iter_errors({"thing": "not an integer"})
+        self.assertIsInstance(error, exceptions.ValidationError)
+        self.assertEqual(error.validator, "type")
+        self.assertEqual(error.validator_value, "integer")
+        self.assertEqual(list(error.path), ["thing"])
+        self.assertEqual(
+            list(error.schema_path),
+            ["properties", "thing", "type"],
+        )
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_errors_are_produced_lazily(self):
+        store = {
+            self.MAIN: {
+                "$id": self.MAIN,
+                "properties": {
+                    "a": {"type": "integer"},
+                    "b": {"$ref": "rules/child.json"},
+                },
+            },
+            self.CHILD: {"$id": self.CHILD, "type": "string"},
+        }
+        resolver = LegacyContextManagerResolver(self.MAIN, store)
+        validator = self.validator(store[self.MAIN], resolver)
+
+        errors = validator.iter_errors({"a": "wrong", "b": 37})
+        first = next(errors)
+        self.assertEqual(list(first.path), ["a"])
+        # the reference for the not-yet-reached property is untouched
+        self.assertEqual(resolver.resolutions, [])
+        errors.close()
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_closing_errors_early_exits_the_resolution_scope(self):
+        store = self.store()
+        resolver = LegacyContextManagerResolver(self.MAIN, store)
+        validator = self.validator(store[self.MAIN], resolver)
+
+        errors = validator.iter_errors({"thing": "not an integer"})
+        next(errors)
+        self.assertNotEqual(resolver.scopes, [self.MAIN])
+        errors.close()
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+        # the next instance does not inherit the old file location
+        validator.validate({"thing": 12})
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_exceptions_during_validation_exit_the_resolution_scope(self):
+        class Boom(dict):
+            def __contains__(self, key):
+                raise RuntimeError("boom")
+
+        store = {
+            self.MAIN: {"$id": self.MAIN, "$ref": "rules/child.json"},
+            self.CHILD: {
+                "$id": self.CHILD,
+                "properties": {"x": {"type": "integer"}},
+            },
+        }
+        resolver = LegacyContextManagerResolver(self.MAIN, store)
+        validator = self.validator(store[self.MAIN], resolver)
+
+        with self.assertRaises(RuntimeError):
+            list(validator.iter_errors(Boom(x=1)))
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+        # the next instance does not inherit the old file location
+        validator.validate({"x": 12})
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_unresolvable_references_raise_not_validate(self):
+        resolver = LegacyContextManagerResolver(self.MAIN, {})
+        validator = self.validator(
+            {"$ref": "rules/missing.json"}, resolver,
+        )
+
+        with self.assertRaises(KeyError):
+            validator.validate(12)
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_boolean_schemas_stay_in_scope(self):
+        store = {
+            "https://example.com/always.json": True,
+            "https://example.com/never.json": False,
+        }
+        resolver = LegacyContextManagerResolver("https://example.com/", store)
+
+        always = self.validator({"$ref": "always.json"}, resolver)
+        self.assertTrue(always.is_valid(37))
+
+        never = self.validator({"$ref": "never.json"}, resolver)
+        (error,) = never.iter_errors(37)
+        self.assertEqual(error.message, "False schema does not allow 37")
+
+        self.assertEqual(resolver.scopes, ["https://example.com/"])
+
+    def test_nested_relative_reference_to_a_boolean_schema(self):
+        store = {
+            self.MAIN: {"$id": self.MAIN, "$ref": "rules/child.json"},
+            self.CHILD: {"$id": self.CHILD, "$ref": "other.json"},
+            self.OTHER: False,
+        }
+        resolver = LegacyContextManagerResolver(self.MAIN, store)
+        validator = self.validator(store[self.MAIN], resolver)
+
+        (error,) = validator.iter_errors("x")
+        self.assertIn("False schema does not allow", error.message)
+        self.assertEqual(resolver.scopes, [self.MAIN])
+
+    def test_refresolver_scopes_cover_lazy_error_production(self):
+        schema = {
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"$ref": "rules/child.json"},
+            },
+        }
+        store = {
+            # no $ids, so that push_scope/pop_scope stay symmetric
+            self.CHILD: {"$ref": "other.json"},
+            self.OTHER: {"type": "integer"},
+        }
+        resolver = validators._RefResolver(self.MAIN, schema, store=store)
+        validator = self.validator(schema, resolver)
+
+        errors = validator.iter_errors({"a": "x", "b": "y"})
+
+        first = next(errors)
+        self.assertEqual(list(first.path), ["a"])
+        # the reference has not even been resolved yet
+        self.assertEqual(resolver._scopes_stack, [self.MAIN])
+
+        second = next(errors)
+        self.assertEqual(list(second.path), ["b"])
+        # while suspended, the referenced scopes are still entered
+        self.assertEqual(
+            resolver._scopes_stack,
+            [self.MAIN, self.CHILD, self.OTHER],
+        )
+
+        self.assertEqual(list(errors), [])
+        self.assertEqual(resolver._scopes_stack, [self.MAIN])
+
+    def test_refresolver_does_not_resolve_references_eagerly(self):
+        schema = {
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"$ref": "rules/child.json"},
+            },
+        }
+        store = {
+            self.CHILD: {
+                "properties": {
+                    "x": {"type": "integer"},
+                    # unresolvable, but only once it is actually reached
+                    "y": {"$ref": "rules/child.json#/definitions/missing"},
+                },
+            },
+        }
+        resolver = validators._RefResolver(self.MAIN, schema, store=store)
+        validator = self.validator(schema, resolver)
+        instance = {"a": "bad", "b": {"x": "bad", "y": 1}}
+
+        errors = validator.iter_errors(instance)
+        self.assertEqual(list(next(errors).path), ["a"])
+        self.assertEqual(list(next(errors).path), ["b", "x"])
+        errors.close()
+        self.assertEqual(resolver._scopes_stack, [self.MAIN])
+
+        # consuming everything does reach (and raise) the broken reference
+        with self.assertRaises(exceptions._RefResolutionError):
+            list(validator.iter_errors(instance))
+        self.assertEqual(resolver._scopes_stack, [self.MAIN])
+
+    def test_refresolver_closing_errors_early_pops_scopes(self):
+        schema = {"$ref": "rules/child.json"}
+        store = {
+            self.CHILD: {"$ref": "other.json"},
+            self.OTHER: {"type": "integer"},
+        }
+        resolver = validators._RefResolver(self.MAIN, schema, store=store)
+        validator = self.validator(schema, resolver)
+
+        errors = validator.iter_errors("not an integer")
+        next(errors)
+        self.assertNotEqual(resolver._scopes_stack, [self.MAIN])
+        errors.close()
+        self.assertEqual(resolver._scopes_stack, [self.MAIN])
+
+        # the next instance does not inherit the old file location
+        validator.validate(12)
+        self.assertEqual(resolver._scopes_stack, [self.MAIN])
+
+    def test_modern_registry_validates_the_same_in_memory_schemas(self):
+        store = self.store()
+        registry = referencing.Registry().with_resources([
+            (
+                uri,
+                referencing.Resource.from_contents(
+                    schema,
+                    default_specification=DRAFT202012,
+                ),
+            )
+            for uri, schema in store.items()
+        ])
+        validator = validators.Draft202012Validator(
+            store[self.MAIN],
+            registry=registry,
+        )
+
+        validator.validate({"thing": 12})
+        (error,) = validator.iter_errors({"thing": "not an integer"})
+        self.assertEqual(error.validator, "type")
+        self.assertEqual(list(error.path), ["thing"])
+        self.assertEqual(
+            list(error.schema_path),
+            ["properties", "thing", "type"],
         )
 
 
