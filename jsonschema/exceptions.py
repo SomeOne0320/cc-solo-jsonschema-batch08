@@ -262,6 +262,18 @@ class _WrappedReferencingError(_RefResolutionError, _Unresolvable):  # pragma: n
         return f"{self._wrapped.__class__.__name__}: {self._wrapped}"
 
 
+class BundleError(Exception):
+    """
+    A schema could not be bundled into a single standalone document.
+
+    This is raised by `jsonschema.bundle` when a reference points at a
+    resource, anchor, or document-internal location which is not available
+    in the in-memory registry provided by the caller. Bundling never
+    retrieves missing resources externally, so such a reference is an error
+    rather than something silently dropped from the resulting document.
+    """
+
+
 class UndefinedTypeCheck(Exception):
     """
     A type checker was asked to check a type it did not have registered.

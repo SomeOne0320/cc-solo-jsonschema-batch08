@@ -291,6 +291,88 @@ which should in this case indicate the example data is invalid:
 
 Retrieving resources from a SQLite database or some other network-accessible resource should be more or less similar, replacing the HTTP client with one for your database of course.
 
+.. _bundling:
+
+Bundling Schemas Into a Single Offline Document
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes a collection of schemas spread across multiple files -- each referencing the others via relative references -- needs to be handed off as *one* JSON file, for example to an offline import program which has no access to the original directory structure or to the network.
+
+The :func:`jsonschema.bundle` function produces such a self-contained document.
+It takes a Draft 2020-12 main schema which declares an absolute :kw:`$id`, along with an in-memory `referencing.Registry` containing every external resource the main schema may reference, and returns a new schema with all of the reachable external resources embedded under its :kw:`$defs` keyword.
+
+Only resources reachable by following references from the main schema are embedded; unrelated registry entries are ignored.
+Reference strings are left untouched, and any *relative* :kw:`$id` found in an embedded resource is rewritten to the absolute URI it originally resolved to, so the meaning of those references does not change.
+Neither the input schema nor the registry is modified.
+The registry's retrieval callback is never invoked -- if a referenced resource, anchor, or document-internal location is missing, a `jsonschema.exceptions.BundleError` is raised rather than silently producing an incomplete document.
+
+Suppose we have a main schema and a second schema sitting next to it on disk:
+
+.. testcode::
+
+    import json
+
+    from referencing import Registry
+    from referencing.jsonschema import DRAFT202012
+
+    from jsonschema import Draft202012Validator, bundle
+
+    main_schema = {
+        "$id": "https://example.com/schemas/main.json",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"name": {"$ref": "types.json#/$defs/name"}},
+    }
+    types_schema = {
+        "$id": "types.json",  # a relative $id, relative to the on-disk location
+        "$defs": {"name": {"type": "string", "minLength": 1}},
+    }
+
+    # All external resources the main schema needs are registered up front,
+    # keyed by the absolute URI their relative references resolve against.
+    registry = Registry().with_resource(
+        "https://example.com/schemas/types.json",
+        DRAFT202012.create_resource(types_schema),
+    )
+
+    bundled = bundle(main_schema, registry)
+
+The result is a single schema document.
+The referenced resource has been embedded, and its relative :kw:`$id` now carries the absolute URI it originally resolved to, while the original ``$ref`` string in the main schema is unchanged:
+
+.. testcode::
+
+    print(bundled["properties"]["name"]["$ref"])
+    print(bundled["$defs"]["https___example_com_schemas_types_json"]["$id"])
+
+.. testoutput::
+
+    types.json#/$defs/name
+    https://example.com/schemas/types.json
+
+The bundled document can then be serialized to JSON and used entirely offline.
+On the receiving machine, register it as a single resource in an otherwise empty registry and validate exactly as before -- the pass/fail result for any instance is unchanged:
+
+.. testcode::
+
+    offline_registry = Registry().with_resource(
+        bundled["$id"],
+        DRAFT202012.create_resource(bundled),
+    )
+    offline_validator = Draft202012Validator(
+        bundled,
+        registry=offline_registry,
+    )
+    offline_validator.validate({"name": "some name"})
+    assert not offline_validator.is_valid({"name": ""})
+
+    # The whole point: this single JSON object is all that needs to travel.
+    print(json.dumps(bundled, sort_keys=True)[:25] + "...")
+
+.. testoutput::
+
+    {"$defs": {"https___exa...
+
 .. warning::
 
     Be sure you understand the security implications of the reference resolution you configure.

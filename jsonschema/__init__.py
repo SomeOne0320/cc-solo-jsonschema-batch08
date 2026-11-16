@@ -12,7 +12,8 @@ import warnings
 
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.bundling import bundle
+from jsonschema.exceptions import BundleError, SchemaError, ValidationError
 from jsonschema.validators import (
     Draft3Validator,
     Draft4Validator,
@@ -106,6 +107,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "BundleError",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
@@ -116,5 +118,6 @@ __all__ = [
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "bundle",
     "validate",
 ]

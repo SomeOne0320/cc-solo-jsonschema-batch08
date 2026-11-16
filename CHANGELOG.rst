@@ -1,6 +1,7 @@
 v4.26.0
 =======
 
+* Add ``jsonschema.bundle`` for combining a Draft 2020-12 schema with the in-memory registry resources it references into a single self-contained schema document, suitable for offline use. Missing resources, anchors, or document-internal locations raise a new ``jsonschema.BundleError`` rather than triggering external retrieval.
 * Decrease import time by delaying importing of ``urllib.request`` (#1416).
 
 v4.25.1
