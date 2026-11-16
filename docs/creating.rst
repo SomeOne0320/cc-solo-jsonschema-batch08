@@ -28,6 +28,13 @@ instance, or schema, it should pass one or both of the ``path`` or
 ``schema_path`` arguments to ``descend`` in order to properly maintain
 where in the instance or schema respectively the error occurred.
 
+Validating functions only need to provide the details which are specific
+to the failure (typically just a ``message``, and any ``path`` or
+``schema_path`` within the keyword's own value). The ``validator``,
+``validator_value``, ``instance``, ``schema`` and type checker of an error
+are filled in centrally, and are not overwritten if the validating
+function already set them.
+
 The Validator Protocol
 ----------------------
 

@@ -132,6 +132,121 @@ _REMOTE_WARNING_REGISTRY = SPECIFICATIONS.combine(
     referencing.Registry(retrieve=_warn_for_remote_retrieve),  # type: ignore[call-arg]
 )
 
+#: Keywords which are represented by the location of their children, rather
+#: than by their own entry in the schema path.
+_KEYWORDS_WITHOUT_SCHEMA_PATH = frozenset({"if", "$ref"})
+
+
+def _false_schema_error(instance, schema):
+    """
+    Create the error for an instance which failed under a ``False`` schema.
+    """
+    return exceptions.ValidationError(
+        f"False schema does not allow {instance!r}",
+        validator=None,
+        validator_value=None,
+        instance=instance,
+        schema=schema,
+    )
+
+
+def _set_error_details(
+    error,
+    *,
+    keyword,
+    keyword_value,
+    instance,
+    schema,
+    type_checker,
+    path=None,
+    schema_path=None,
+):
+    """
+    Fill in any missing details of an error and place it within its schema.
+
+    This is the one place where errors produced by keyword validators are
+    supplemented, for both top-level validation and descent into
+    subschemas. Any details a keyword validator already set are left
+    alone, since `jsonschema.exceptions._Error._set` only fills unset
+    fields (which also lets a keyword override its own details).
+
+    To add a new field to every error:
+
+    * if its value comes from the validation context (as do the fields
+      below), add it to the ``_set`` call here, and, if the value is not
+      already one of this function's arguments, pass it in from
+      `_iter_keyword_errors` (and ultimately from the caller which has
+      that context, such as `create`'s ``Validator``);
+    * if a keyword needs to provide a different value, it can simply set
+      it on the `jsonschema.exceptions.ValidationError` it yields; nothing
+      here will overwrite it.
+
+    The error is then placed at its keyword in the schema path, and, when
+    provided, at the parent instance and schema positions.
+    """
+    error._set(
+        validator=keyword,
+        validator_value=keyword_value,
+        instance=instance,
+        schema=schema,
+        type_checker=type_checker,
+    )
+    if keyword not in _KEYWORDS_WITHOUT_SCHEMA_PATH:
+        error.schema_path.appendleft(keyword)
+    if path is not None:
+        error.path.appendleft(path)
+    if schema_path is not None:
+        error.schema_path.appendleft(schema_path)
+
+
+def _iter_keyword_errors(
+    validator,
+    instance,
+    schema,
+    keyword_validators,
+    *,
+    path=None,
+    schema_path=None,
+):
+    """
+    Run the given keyword validators in order, supplementing their errors.
+
+    ``keyword_validators`` is an iterable of ``(callable, keyword, value)``
+    triples, as selected by `_keyword_validators`. It is consumed lazily so
+    that keywords after the first error are not run until they are asked
+    for.
+    """
+    for keyword_validator, keyword, value in keyword_validators:
+        errors = keyword_validator(validator, value, instance, schema) or ()
+        for error in errors:
+            _set_error_details(
+                error,
+                keyword=keyword,
+                keyword_value=value,
+                instance=instance,
+                schema=schema,
+                type_checker=validator.TYPE_CHECKER,
+                path=path,
+                schema_path=schema_path,
+            )
+            yield error
+
+
+def _keyword_validators(validators, keyword_values):
+    """
+    Select the validators applicable to ``keyword_values``.
+
+    ``validators`` maps keywords to keyword validators, and
+    ``keyword_values`` is an iterable of ``(keyword, value)`` pairs in the
+    order in which they are applicable. Unknown keywords are ignored. The
+    selection is lazy, so that later keywords are not looked at until the
+    caller asks for them.
+    """
+    for keyword, value in keyword_values:
+        validator = validators.get(keyword)
+        if validator is not None:
+            yield validator, keyword, value
+
 
 def create(
     meta_schema: referencing.jsonschema.ObjectSchema,
@@ -290,11 +405,12 @@ def create(
             if self.schema is True or self.schema is False:
                 self._validators = []
             else:
-                self._validators = [
-                    (self.VALIDATORS[k], k, v)
-                    for k, v in applicable_validators(self.schema)
-                    if k in self.VALIDATORS
-                ]
+                self._validators = list(
+                    _keyword_validators(
+                        self.VALIDATORS,
+                        applicable_validators(self.schema),
+                    ),
+                )
 
             # REMOVEME: Legacy ref resolution state management.
             push_scope = getattr(self._ref_resolver, "push_scope", None)
@@ -358,40 +474,27 @@ def create(
                     DeprecationWarning,
                     stacklevel=2,
                 )
-                validators = [
-                    (self.VALIDATORS[k], k, v)
-                    for k, v in applicable_validators(_schema)
-                    if k in self.VALIDATORS
-                ]
+                keyword_validators = list(
+                    _keyword_validators(
+                        self.VALIDATORS,
+                        applicable_validators(_schema),
+                    ),
+                )
             else:
-                _schema, validators = self.schema, self._validators
+                _schema, keyword_validators = self.schema, self._validators
 
             if _schema is True:
                 return
             elif _schema is False:
-                yield exceptions.ValidationError(
-                    f"False schema does not allow {instance!r}",
-                    validator=None,
-                    validator_value=None,
-                    instance=instance,
-                    schema=_schema,
-                )
+                yield _false_schema_error(instance, _schema)
                 return
 
-            for validator, k, v in validators:
-                errors = validator(self, v, instance, _schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    yield error
+            yield from _iter_keyword_errors(
+                self,
+                instance,
+                _schema,
+                keyword_validators,
+            )
 
         def descend(
             self,
@@ -404,13 +507,7 @@ def create(
             if schema is True:
                 return
             elif schema is False:
-                yield exceptions.ValidationError(
-                    f"False schema does not allow {instance!r}",
-                    validator=None,
-                    validator_value=None,
-                    instance=instance,
-                    schema=schema,
-                )
+                yield _false_schema_error(instance, schema)
                 return
 
             if self._ref_resolver is not None:
@@ -422,28 +519,17 @@ def create(
                     )
                 evolved = self.evolve(schema=schema, _resolver=resolver)
 
-            for k, v in applicable_validators(schema):
-                validator = evolved.VALIDATORS.get(k)
-                if validator is None:
-                    continue
-
-                errors = validator(evolved, v, instance, schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    if path is not None:
-                        error.path.appendleft(path)
-                    if schema_path is not None:
-                        error.schema_path.appendleft(schema_path)
-                    yield error
+            yield from _iter_keyword_errors(
+                evolved,
+                instance,
+                schema,
+                _keyword_validators(
+                    evolved.VALIDATORS,
+                    applicable_validators(schema),
+                ),
+                path=path,
+                schema_path=schema_path,
+            )
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):

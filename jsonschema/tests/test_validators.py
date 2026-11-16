@@ -1599,6 +1599,300 @@ class TestValidationErrorDetails(TestCase):
         )
 
 
+class TestKeywordSelectionAndErrorDetails(TestCase):
+    """
+    Tests for how keyword validators are selected and how the errors they
+    produce are supplemented, for the top-level and subschema paths.
+    """
+
+    def test_errors_are_supplemented_for_top_level_validation(self):
+        def keyword(validator, value, instance, schema):
+            yield exceptions.ValidationError("bad")
+
+        Validator = validators.create(
+            meta_schema={},
+            validators={"k": keyword},
+        )
+        error, = Validator({"k": 12}).iter_errors("instance")
+
+        self.assertEqual(
+            (
+                error.message,
+                error.validator,
+                error.validator_value,
+                error.instance,
+                error.schema,
+                error.schema_path,
+            ),
+            (
+                "bad",
+                "k",
+                12,
+                "instance",
+                {"k": 12},
+                deque(["k"]),
+            ),
+        )
+
+    def test_already_set_error_details_are_not_overwritten(self):
+        def keyword(validator, value, instance, schema):
+            yield exceptions.ValidationError(
+                "bad",
+                validator="preset",
+                validator_value="preset value",
+                instance="preset instance",
+                schema={"preset": True},
+                path=["preset path"],
+                schema_path=["preset schema path"],
+            )
+
+        Validator = validators.create(
+            meta_schema={},
+            validators={"k": keyword},
+        )
+        error, = Validator({"k": 12}).iter_errors("instance")
+
+        self.assertEqual(
+            (
+                error.validator,
+                error.validator_value,
+                error.instance,
+                error.schema,
+                error.path,
+                error.schema_path,
+            ),
+            (
+                "preset",
+                "preset value",
+                "preset instance",
+                {"preset": True},
+                deque(["preset path"]),
+                deque(["k", "preset schema path"]),
+            ),
+        )
+
+    def test_keyword_validators_can_return_nothing_or_multiple_errors(self):
+        def nothing(validator, value, instance, schema):
+            return None
+
+        def many(validator, value, instance, schema):
+            yield from (
+                exceptions.ValidationError("one"),
+                exceptions.ValidationError("two"),
+            )
+
+        Validator = validators.create(
+            meta_schema={},
+            validators={"nothing": nothing, "many": many},
+        )
+        errors = list(
+            Validator({"nothing": 1, "many": 2}).iter_errors("instance"),
+        )
+
+        self.assertEqual([error.message for error in errors], ["one", "two"])
+        self.assertEqual(
+            [error.validator for error in errors],
+            ["many", "many"],
+        )
+        self.assertEqual(
+            [error.schema_path for error in errors],
+            [deque(["many"]), deque(["many"])],
+        )
+
+    def test_keywords_run_in_order_and_later_ones_are_lazy(self):
+        called = []
+
+        def first(validator, value, instance, schema):
+            called.append("first")
+            yield exceptions.ValidationError("first error")
+
+        def second(validator, value, instance, schema):
+            called.append("second")
+            yield exceptions.ValidationError("second error")
+
+        Validator = validators.create(
+            meta_schema={},
+            validators={"first": first, "second": second},
+        )
+        errors = Validator({"first": 1, "second": 2}).iter_errors("instance")
+
+        error = next(errors)
+        self.assertEqual(error.message, "first error")
+        self.assertEqual(called, ["first"])
+
+        error = next(errors)
+        self.assertEqual(error.message, "second error")
+        self.assertEqual(called, ["first", "second"])
+
+    def test_boolean_schemas_are_handled_without_keywords(self):
+        Validator = validators.create(meta_schema={}, validators={})
+
+        self.assertEqual(list(Validator(True).iter_errors(12)), [])
+        error, = Validator(False).iter_errors(12)
+        self.assertEqual(
+            (
+                error.message,
+                error.validator,
+                error.validator_value,
+                error.instance,
+                error.schema,
+                error.schema_path,
+            ),
+            (
+                "False schema does not allow 12",
+                None,
+                None,
+                12,
+                False,
+                deque([]),
+            ),
+        )
+
+    def test_descend_supplements_relative_and_absolute_positions(self):
+        schema = {"properties": {"foo": {"minimum": 3}}}
+        validator = validators.Draft202012Validator(schema)
+
+        # A descender supplies paths, as keyword validators do.
+        error, = validator.descend(
+            1,
+            {"minimum": 3},
+            path="foo",
+            schema_path="foo",
+        )
+        self.assertEqual(error.schema_path, deque(["foo", "minimum"]))
+        self.assertEqual(error.relative_schema_path, deque(["foo", "minimum"]))
+        self.assertEqual(error.absolute_schema_path, deque(["foo", "minimum"]))
+
+        error, = validator.iter_errors({"foo": 1})
+        self.assertEqual(error.path, deque(["foo"]))
+        self.assertEqual(error.absolute_path, deque(["foo"]))
+        self.assertEqual(
+            error.schema_path,
+            deque(["properties", "foo", "minimum"]),
+        )
+        self.assertEqual(error.json_path, "$.foo")
+
+    def test_descend_ignores_keywords_without_a_validator(self):
+        validator = validators.Draft202012Validator({})
+        self.assertEqual(
+            list(validator.descend("instance", {"notAKeyword": 12})),
+            [],
+        )
+
+    def test_subschemas_with_a_different_version_use_their_validator(self):
+        schema = {
+            "properties": {
+                "foo": {
+                    "$schema": "http://json-schema.org/draft-03/schema#",
+                    "type": "any",
+                },
+            },
+        }
+        self.assertTrue(
+            validators.Draft202012Validator(schema).is_valid({"foo": 12}),
+        )
+
+        schema = {
+            "properties": {
+                "foo": {
+                    "$schema": "http://json-schema.org/draft-03/schema#",
+                    "disallow": "string",
+                },
+            },
+        }
+        error, = validators.Draft202012Validator(schema).iter_errors(
+            {"foo": "bar"},
+        )
+        self.assertEqual(error.validator, "disallow")
+        self.assertEqual(
+            error.schema_path,
+            deque(["properties", "foo", "disallow"]),
+        )
+
+    def test_descended_errors_use_the_evolved_type_checker(self):
+        type_checker = validators.Draft202012Validator.TYPE_CHECKER.redefine(
+            "even",
+            lambda checker, instance: (
+                isinstance(instance, int) and instance % 2 == 0
+            ),
+        )
+        Validator = validators.extend(
+            validators.Draft202012Validator,
+            type_checker=type_checker,
+        )
+        schema = {"properties": {"foo": {"type": "even"}}}
+
+        error, = Validator(schema).iter_errors({"foo": 3})
+        self.assertIs(error._type_checker, type_checker)
+        self.assertFalse(error._matches_type())
+
+    def test_descended_errors_use_the_format_checker(self):
+        checker = FormatChecker()
+
+        @checker.checks("foo")
+        def check(value):
+            return value == "good"
+
+        validator = validators.Draft202012Validator(
+            {"properties": {"foo": {"format": "foo"}}},
+            format_checker=checker,
+        )
+        error, = validator.iter_errors({"foo": "bad"})
+        self.assertEqual(error.validator, "format")
+        self.assertEqual(
+            error.schema_path,
+            deque(["properties", "foo", "format"]),
+        )
+
+    def test_descended_errors_use_the_registry(self):
+        def retrieve(uri):
+            return DRAFT202012.create_resource({"type": "integer"})
+
+        registry = referencing.Registry(retrieve=retrieve)
+        schema = {
+            "properties": {
+                "foo": {"$ref": "https://example.com/"},
+            },
+        }
+        validator = validators.Draft202012Validator(
+            schema,
+            registry=registry,
+        )
+        error, = validator.iter_errors({"foo": "bar"})
+        self.assertEqual(error.message, "'bar' is not of type 'integer'")
+        self.assertEqual(
+            error.schema_path,
+            deque(["properties", "foo", "type"]),
+        )
+
+    def test_extended_validators_run_their_custom_keywords(self):
+        def keyword(validator, value, instance, schema):
+            yield exceptions.ValidationError("extended")
+
+        Extended = validators.extend(
+            validators.Draft202012Validator,
+            validators={"extended": keyword},
+        )
+        error, = Extended({"extended": 12}).iter_errors("instance")
+        self.assertEqual(error.validator, "extended")
+        self.assertEqual(error.schema_path, deque(["extended"]))
+
+    def test_deprecated_iter_errors_schema_is_supplemented(self):
+        validator = validators.Draft7Validator({})
+        with self.assertWarns(DeprecationWarning):
+            error, = validator.iter_errors(
+                {"foo": "bar"},
+                {"properties": {"foo": {"type": "number"}}},
+            )
+
+        self.assertEqual(error.validator, "type")
+        self.assertEqual(error.path, deque(["foo"]))
+        self.assertEqual(
+            error.schema_path,
+            deque(["properties", "foo", "type"]),
+        )
+
+
 class MetaSchemaTestsMixin:
     # TODO: These all belong upstream
     def test_invalid_properties(self):
