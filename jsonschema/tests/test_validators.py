@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque, namedtuple
 from contextlib import contextmanager
+from copy import deepcopy
 from decimal import Decimal
 from io import BytesIO
 from typing import Any
@@ -1872,6 +1873,36 @@ class ValidatorTestMixin(MetaSchemaTestsMixin):
         for instance in invalid_instances:
             with self.assertRaises(exceptions.ValidationError):
                 validator.validate(instance)
+
+    def test_uniqueItems_does_not_modify_the_instance(self):
+        validator = self.Validator({"uniqueItems": True})
+        instance = [
+            {"b": 2, "a": 1},
+            [3, 1, 2],
+            {"a": 1, "b": 2},
+            "x", 1, True, None,
+        ]
+        snapshot = deepcopy(instance)
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate(instance)
+        self.assertEqual(instance, snapshot)
+        self.assertEqual(list(instance[0]), ["b", "a"])
+        self.assertEqual(list(instance[2]), ["a", "b"])
+
+    def test_uniqueItems_sees_current_contents_of_the_instance(self):
+        validator = self.Validator({"uniqueItems": True})
+        record = {"a": [1, 2]}
+        instance = [record, {"a": [1, 2]}]
+
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate(instance)
+
+        record["a"].append(3)
+        validator.validate(instance)
+
+        record["a"].pop()
+        with self.assertRaises(exceptions.ValidationError):
+            validator.validate(instance)
 
     def test_it_creates_a_ref_resolver_if_not_provided(self):
         with self.assertWarns(DeprecationWarning):

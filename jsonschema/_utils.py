@@ -153,13 +153,80 @@ def unbool(element, true=object(), false=object()):
     return element
 
 
+class _NotPlainJSON(Exception):
+    """
+    Signal (internally) that an element isn't made of plain JSON data.
+    """
+
+
+#: Hash keys standing in for null and the booleans when deduplicating plain
+#: JSON data. They keep null and the booleans distinct from each other and
+#: from any number, unlike Python's ``True == 1`` and ``False == 0``.
+_NULL_KEY = object()
+_TRUE_KEY = object()
+_FALSE_KEY = object()
+
+
+def _plain_json_key(element):
+    """
+    Return a hashable key for an element of plain JSON data, for `uniq`.
+
+    Two elements of plain JSON data are `equal` exactly when their keys are
+    equal (and therefore hash equal): object keys are unordered, array order
+    is preserved, null and booleans stay distinct from numbers, and ``1``
+    and ``1.0`` share a key. Deduplicating the keys with a set then takes
+    work proportional to the total size of the data, instead of comparing
+    every element with every earlier element. Keys are computed from the
+    current contents of the elements on every call, so nothing is cached
+    and later mutations of the elements are seen.
+
+    Raises `_NotPlainJSON` for anything that is not plain JSON data (exact
+    dicts, lists, tuples, strings, numbers, booleans and null), so `uniq`
+    can fall back to generic comparison for custom objects.
+    """
+    if element is None:
+        return _NULL_KEY
+    if element is True:
+        return _TRUE_KEY
+    if element is False:
+        return _FALSE_KEY
+    type_of = type(element)
+    if type_of is str:
+        return element
+    if type_of is int or type_of is float:
+        return element
+    if type_of is list or type_of is tuple:
+        return tuple(_plain_json_key(item) for item in element)
+    if type_of is dict:
+        items = []
+        for key, value in element.items():
+            if type(key) is not str:
+                raise _NotPlainJSON
+            items.append((key, _plain_json_key(value)))
+        return frozenset(items)
+    raise _NotPlainJSON
+
+
 def uniq(container):
     """
     Check if all of a container's elements are unique.
 
-    Tries to rely on the container being recursively sortable, or otherwise
-    falls back on (slow) brute force.
+    Plain JSON data is deduplicated by hashing, in a single pass whose work
+    is proportional to the total size of the data. Anything else falls back
+    to relying on the container being recursively sortable, or otherwise on
+    (slow) brute force.
     """
+    try:
+        seen = set()
+        for element in container:
+            key = _plain_json_key(element)
+            if key in seen:
+                return False
+            seen.add(key)
+        return True
+    except (_NotPlainJSON, RecursionError):
+        pass  # Fall through to the generic implementation.
+
     try:
         sort = sorted(unbool(i) for i in container)
         sliced = itertools.islice(sort, 1, None)
